@@ -10,6 +10,7 @@ pub enum Target {
     Gas_AArch64_Linux,
     Uxn,
     Mos6502,
+    Jvm,
     // TODO(2025-06-12 20:26:01): IR should not be a target. It should be just a flag for debugging.
     //   - rexim
     IR,
@@ -34,6 +35,7 @@ pub const TARGET_NAMES: *const [Target_Name] = &[
     Target_Name { name: c!("uxn"),                 target: Target::Uxn                 },
     Target_Name { name: c!("6502"),                target: Target::Mos6502             },
     Target_Name { name: c!("ir"),                  target: Target::IR                  },
+    Target_Name { name: c!("jvm"),                 target: Target::Jvm                 },
 ];
 
 pub unsafe fn name_of_target(target: Target) -> Option<*const c_char> {
@@ -59,6 +61,8 @@ pub unsafe fn target_word_size(target: Target) -> u64 {
         Target::Fasm_x86_64_Windows => 8,
         Target::Fasm_x86_64_Linux   => 8,
         Target::Gas_AArch64_Linux   => 8,
+        //TODO find out what this is to supply the correct value
+        Target::Jvm                 => 8,
         Target::Uxn                 => 2,
         Target::Mos6502             => 2,
         Target::IR                  => 1,

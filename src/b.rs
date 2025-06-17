@@ -1587,6 +1587,24 @@ pub unsafe fn main(mut argc: i32, mut argv: *mut*mut c_char) -> Option<()> {
             if *run {
                 todo!("Interpret the IR?");
             }
+        },
+        Target::Jvm => {
+            codegen::jvm::generate_program(&mut output, &c);
+
+            let effective_output_path;
+            if (*output_path).is_null() {
+                let input_path = *input_paths.items;
+                let base_path = temp_strip_suffix(input_path, c!(".b")).unwrap_or(input_path);
+                effective_output_path = temp_sprintf(c!("%s.class"), base_path);
+            } else {
+                effective_output_path = *output_path;
+            }
+
+            if !write_entire_file(effective_output_path, output.items as *const c_void, output.count) { return None; }
+            printf(c!("INFO: Generated %s\n"), effective_output_path);
+            if *run {
+                todo!("Run the jvm?");
+            }
         }
     }
     Some(())
