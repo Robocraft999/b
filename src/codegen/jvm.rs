@@ -2,11 +2,14 @@ use core::ffi::*;
 use core::mem::zeroed;
 use crate::nob::*;
 use crate::crust::libc::*;
-use crate::{Op, Binop, OpWithLocation, Arg, Func, Global, ImmediateValue, Compiler, missingf, AsmFunc};
+use crate::{Op, Binop, OpWithLocation, Arg, Func, Global, ImmediateValue, Compiler, missingf, AsmFunc, Loc};
 
-const CONSTANT_UTF8: u8 = 1;
-const CONSTANT_CLASS: u8 = 7;
-const CONSTANT_METHODREF: u8 = 10;
+const CONSTANT_UTF8:        u8 = 1;
+const CONSTANT_INTEGER:     u8 = 3;
+const CONSTANT_LONG:        u8 = 5;
+const CONSTANT_CLASS:       u8 = 7;
+const CONSTANT_STRING:      u8 = 8;
+const CONSTANT_METHODREF:   u8 = 10;
 const CONSTANT_NAMEANDTYPE: u8 = 12;
 
 /*pub unsafe fn da_contains<T: PartialEq>(xs: *mut Array<T>, item: T) -> bool {
@@ -31,7 +34,10 @@ pub unsafe fn da_index_of<T: PartialEq>(xs: *mut Array<T>, item: T) -> Option<us
 #[derive(Clone, Copy, PartialEq)]
 pub enum CpInfo{
     Utf8 { value: *const c_char },
+    Integer { value: i32 },
+    Long { value: i64 },
     Class { name_index: u16 },
+    String { string_index: u16 },
     Methodref { class_index: u16, name_and_type_index: u16 },
     NameAndType { name_index: u16, type_index: u16 },
 }
@@ -67,9 +73,22 @@ pub unsafe fn write_cp_info(output: *mut String_Builder, cp_info: CpInfo) {
             write_word(output, strlen(value) as u16);
             sb_appendf(output, value);
         }
+        CpInfo::Integer { value } => {
+            write_byte(output, CONSTANT_INTEGER);
+            write_dword(output, value as u32);
+        }
+        CpInfo::Long { value } => {
+            write_byte(output, CONSTANT_LONG);
+            write_dword(output, (value >> 32) as u32);
+            write_dword(output, value as u32);
+        }
         CpInfo::Class { name_index} => {
             write_byte(output, CONSTANT_CLASS);
-            write_word(output, name_index)
+            write_word(output, name_index);
+        }
+        CpInfo::String { string_index } => {
+            write_byte(output, CONSTANT_STRING);
+            write_word(output, string_index);
         }
         CpInfo::Methodref { class_index, name_and_type_index } => {
             write_byte(output, CONSTANT_METHODREF);
@@ -86,25 +105,164 @@ pub unsafe fn write_cp_info(output: *mut String_Builder, cp_info: CpInfo) {
 
 pub unsafe fn dump_arg(arg: Arg) {
     match arg {
-        Arg::External(name)     => printf(c!("%s"), name),
+        Arg::External(name)     => printf(c!("ext %s"), name),
         Arg::Deref(index)       => printf(c!("deref[%zu]"), index),
         Arg::RefAutoVar(index)  => printf(c!("ref auto[%zu]"), index),
         Arg::RefExternal(name)  => printf(c!("ref %s"), name),
-        Arg::Literal(value)     => printf(c!("%ld"), value),
+        Arg::Literal(value)     => printf(c!("const %ld"), value),
         Arg::AutoVar(index)     => printf(c!("auto[%zu]"), index),
         Arg::DataOffset(offset) => printf(c!("data[%zu]"), offset),
         Arg::Bogus              => unreachable!("bogus-amogus")
     };
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum ArgType{
+    Uninitialized,
+    Integer,
+    Long,
+    String
+}
+
+const MAX_I32: u64 = i32::MAX as u64 + 1;
+const MAX_I64: u64 = i64::MAX as u64;
+
+pub unsafe fn load_arg_value(arg: Arg, output: *mut String_Builder, loc: Loc, gen: *mut Generator, local_types: *mut Array<ArgType>) -> ArgType{
+    /*for i in 0..(*local_types).count{
+        match *(*local_types).items.add(i) {
+            ArgType::Integer       => printf(c!("L:   %zu Int\n"), i),
+            ArgType::Long          => printf(c!("L:   %zu Long\n"), i),
+            ArgType::Uninitialized => printf(c!("L:   %zu None\n"), i),
+        };
+    }
+    printf(c!("\n"));*/
+    match arg {
+        Arg::Literal(value) => {
+            match value {
+                v @ 0..=5 => {
+                    write_byte(output, 0x03 + v as u8); //iconst_0 + v
+                    ArgType::Integer
+                }
+                v @ 6..MAX_I32 => {
+                    write_byte(output, 0x12); //ldc
+                    let value_index = get_or_create_cp_info_index(gen, CpInfo::Integer { value: v as i32 });
+                    write_byte(output, value_index as u8);
+                    ArgType::Integer
+                }
+                v @ MAX_I32..=MAX_I64 => {
+                    write_byte(output, 0x14); //ldc2_w
+                    let value_index = get_or_create_cp_info_index(gen, CpInfo::Long { value: v as i64 });
+                    write_word(output, value_index);
+                    ArgType::Long
+                }
+                _ => missingf!(loc, c!("jvm-auto-assign literals larger than i64::max are not supported by the jvm\n")),
+            }
+        },
+        Arg::AutoVar(index) => {
+            let auto_var_type = *(*local_types).items.add(index-1);
+            match auto_var_type {
+                ArgType::Integer => {
+                    if index-1 <= 3{
+                        write_byte(output, (0x1a + index - 1) as u8); //iload_0
+                    } else {
+                        write_byte(output, 0x15); //iload
+                        write_byte(output, (index - 1) as u8); //iload index
+                    }
+                }
+                ArgType::Long => {
+                    if index-1 <= 3{
+                        write_byte(output, (0x1e + index - 1) as u8); //lload_0
+                    } else {
+                        write_byte(output, 0x16); //lload
+                        write_byte(output, (index - 1) as u8); //lload index
+                    }
+                }
+                ArgType::String => {
+                    if index-1 <= 3{
+                        write_byte(output, (0x2a + index - 1) as u8); //aload_0
+                    } else {
+                        write_byte(output, 0x19); //aload
+                        write_byte(output, (index - 1) as u8); //aload index
+                    }
+                }
+                ArgType::Uninitialized => unreachable!("reading of uninitialized auto var at {}", index)
+            }
+            auto_var_type
+        }
+        Arg::External(_) => missingf!(loc, c!("loading args of type Arg::External is not supported yet\n")),
+        Arg::Deref(_) => missingf!(loc, c!("loading args of type Arg::Deref is not supported yet\n")),
+        Arg::RefAutoVar(_) => missingf!(loc, c!("loading args of type Arg::RefAutoVar is not supported yet\n")),
+        Arg::RefExternal(_) => missingf!(loc, c!("loading args of type Arg::RefExternal is not supported yet\n")),
+        Arg::DataOffset(offset) => {
+            for i in 0..(*gen).strings.count{
+                let (data_offset, string_index) = *(*gen).strings.items.add(i);
+                if data_offset == offset{
+                    write_byte(output, 0x12); //ldc
+                    write_byte(output, string_index as u8);
+                }
+            }
+            //missingf!(loc, c!("loading args of type Arg::DataOffset is not supported yet\n")),
+            ArgType::String
+        }
+        Arg::Bogus => unreachable!("bogus-amogus"),
+    }
+}
+
+//auto_var_index is before we subtract 1
+pub unsafe fn store_value(auto_var_index: usize, output: *mut String_Builder, loc: Loc, arg_type: ArgType, local_types: *mut Array<ArgType>) {
+    match arg_type {
+        ArgType::Integer => {
+            if auto_var_index-1 <= 3{
+                printf(temp_sprintf(c!("istore_%zu\n"), auto_var_index-1));
+                write_byte(output, 0x3b + (auto_var_index - 1) as u8) //istore_0 + index
+            } else {
+                printf(temp_sprintf(c!("istore %zu\n"), auto_var_index-1));
+                write_byte(output, 0x36); //istore
+                write_byte(output, (auto_var_index - 1) as u8); //istore index
+            }
+            *(*local_types).items.add(auto_var_index-1) = ArgType::Integer
+        }
+        ArgType::Long => {
+            //storing of long values requires calculation of index offsets, because long takes two slots in locals and stack
+            missingf!(loc, c!("storing of long values not safe yet"));
+            if auto_var_index-1 <= 3{
+                printf(temp_sprintf(c!("lstore_%zu\n"), auto_var_index-1));
+                write_byte(output, 0x3f + (auto_var_index - 1) as u8) //lstore_0 + index
+            } else {
+                printf(temp_sprintf(c!("lstore %zu\n"), auto_var_index-1));
+                write_byte(output, 0x37); //lstore
+                write_byte(output, (auto_var_index - 1) as u8); //lstore index
+            }
+            *(*local_types).items.add(auto_var_index-1) = ArgType::Long
+        }
+        ArgType::String => {
+            if auto_var_index-1 <= 3{
+                printf(temp_sprintf(c!("astore_%zu\n"), auto_var_index-1));
+                write_byte(output, 0x4b + (auto_var_index - 1) as u8) //astore_0 + index
+            } else {
+                printf(temp_sprintf(c!("astore %zu\n"), auto_var_index-1));
+                write_byte(output, 0x3a); //astore
+                write_byte(output, (auto_var_index - 1) as u8); //astore index
+            }
+        }
+        ArgType::Uninitialized => unreachable!("storing uninitialized arg type is not possible")
+    }
+}
+
 pub struct Generator{
     constant_pool: Array<CpInfo>,
     functions: Array<String_Builder>,
+    //(offset, constant_pool_index)
+    strings: Array<(usize, u16)>,
 }
 
-pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_vars_count: usize, body: *const [OpWithLocation], output: *mut String_Builder, gen: *mut Generator) {
+pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_vars_count: usize, body: *const [OpWithLocation], gen: *mut Generator) {
     printf(c!("%s(%zu, %zu):\n"), name, params_count, auto_vars_count);
     let mut info: String_Builder = zeroed();
+    let mut locals_types: Array<ArgType> = zeroed();
+    for _ in 0..auto_vars_count {
+        da_append(&mut locals_types, ArgType::Uninitialized);
+    }
 
     //access_flags
     write_word(&mut info, 0x0001 | 0x0008); //ACC_PUBLIC | ACC_STATIC
@@ -130,41 +288,31 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
             Op::UnaryNot { result: _, arg: _ } => missingf!(op.loc, c!("jvm-unary-not\n")),
             Op::Negate { result: _, arg: _ } => missingf!(op.loc, c!("jvm-negate\n")),
             Op::Asm { args: _ } => missingf!(op.loc, c!("jvm-asm\n")),
-            Op::Binop { binop: _, index: _, lhs: _, rhs: _ } => missingf!(op.loc, c!("binop\n")),
+            Op::Binop { binop, index, lhs, rhs } => {
+                printf(c!("index: %zu, lhs: "), index);
+                dump_arg(lhs);
+                printf(c!(", rhs: "));
+                dump_arg(rhs);
+                printf(c!("\n"));
+
+                let _lhs_arg_type = load_arg_value(lhs, &mut code, op.loc, gen, &mut locals_types);
+                let _rhs_arg_type = load_arg_value(rhs, &mut code, op.loc, gen, &mut locals_types);
+                match binop {
+                    Binop::Plus => {
+                        //TODO match types
+                        write_byte(&mut code, 0x60); //iadd
+                        store_value(index, &mut code, op.loc, ArgType::Integer, &mut locals_types);
+                    }
+                    _ => missingf!(op.loc, c!("binop of this type is not supported yet\n")),
+                }
+            },
             Op::AutoAssign { index, arg} => {
                 printf(c!("[%zu] = "), index);
                 dump_arg(arg);
                 printf(c!("\n"));
-                let value = match arg{
-                    Arg::Literal(value) => value,
-                    _ => missingf!(op.loc, c!("jvm-auto-assign arg type can not be handled\n"))
-                };
-                const max_i32: u64 = i32::MAX as u64 + 1;
-                const max_i64: u64 = i64::MAX as u64;
-                match value {
-                    v @ 0..5 => {
-                        printf(temp_sprintf(c!("iconst_%zu\n"), v));
-                        write_byte(&mut code, 0x03 + v as u8); //iconst_0 + v
-                        if index-1 <= 3{
-                            printf(temp_sprintf(c!("istore_%zu\n"), index-1));
-                            write_byte(&mut code, 0x3b + (index - 1) as u8) //istore_0 + index
-                        } else {
-                            printf(temp_sprintf(c!("istore %zu\n"), index-1));
-                            write_byte(&mut code, 0x36); //istore
-                            write_byte(&mut code, (index - 1) as u8); //istore index
-                        }
-                    }
-                    v @ 6..max_i32 => {
-                        printf(temp_sprintf(c!("ldc [] (%zu)\n"), v));
-                        missingf!(op.loc, c!("jvm-auto-assign literals larger than 5 ar currently not supported\n"));
-                    }
-                    v @ max_i32..=max_i64 => {
-                        printf(temp_sprintf(c!("ldc2_w [] (%zu)\n"), v));
-                        missingf!(op.loc, c!("jvm-auto-assign literals larger than i32::max ar currently not supported\n"));
-                    }
-                    _ => missingf!(op.loc, c!("jvm-auto-assign literals larger than i64::max are not supported by the jvm")),
-                }
+                let arg_type = load_arg_value(arg, &mut code, op.loc, gen, &mut locals_types);
 
+                store_value(index, &mut code, op.loc, arg_type, &mut locals_types);
             }
             Op::ExternalAssign {name: _, arg: _} => missingf!(op.loc, c!("jvm-external-assign\n")),
             Op::Store {index: _, arg: _} => missingf!(op.loc, c!("jvm-store\n")),
@@ -191,11 +339,27 @@ pub unsafe fn generate_function(name: *const c_char, params_count: usize, auto_v
     da_append(&mut (*gen).functions, info);
 }
 
-pub unsafe fn generate_funcs(output: *mut String_Builder, funcs: *const [Func], gen: *mut Generator) {
+pub unsafe fn generate_funcs(funcs: *const [Func], gen: *mut Generator) {
     printf(c!("-- Functions --\n"));
     printf(c!("\n"));
     for i in 0..funcs.len() {
-        generate_function((*funcs)[i].name, (*funcs)[i].params_count, (*funcs)[i].auto_vars_count, da_slice((*funcs)[i].body), output, gen);
+        generate_function((*funcs)[i].name, (*funcs)[i].params_count, (*funcs)[i].auto_vars_count, da_slice((*funcs)[i].body), gen);
+    }
+}
+
+pub unsafe fn generate_strings_from_data_section(output: *mut String_Builder, data: *const [u8], gen: *mut Generator){
+    let mut buffer: Array<c_char> = zeroed();
+    let mut data_offset = 0;
+    for i in 0..data.len(){
+        let c: u8 = (*data)[i];
+        da_append(&mut buffer, c as c_char);
+        if c == b'\0'{
+            let utf_index = get_or_create_cp_info_index(gen, CpInfo::Utf8 { value: da_slice(buffer) as *const c_char });
+            let string_index = get_or_create_cp_info_index(gen, CpInfo::String { string_index: utf_index });
+            da_append(&mut (*gen).strings, (data_offset, string_index));
+            buffer = zeroed();
+            data_offset = i + 1;
+        }
     }
 }
 
@@ -254,6 +418,8 @@ pub unsafe fn generate_body(output: *mut String_Builder, gen: *mut Generator) {
 pub unsafe fn generate_program(output: *mut String_Builder, c: *const Compiler) {
     let mut gen: Generator = zeroed();
     generate_header(output);
-    generate_funcs(output, da_slice((*c).funcs), &mut gen);
+    //TODO try to create the constant pool entries at the spot they are needed
+    generate_strings_from_data_section(output, da_slice((*c).data), &mut gen);
+    generate_funcs(da_slice((*c).funcs), &mut gen);
     generate_body(output, &mut gen);
 }
